@@ -1,33 +1,37 @@
-import json
 import os
+import json
+import uuid
+
 import boto3
 from opensearchpy import OpenSearch, RequestsHttpConnection
 from requests_aws4auth import AWS4Auth
 
-# ========== ENVIRONMENT VARIABLES ==========
-# (configured in Lambda console)
+# --- Env vars ---
 LEX_BOT_ID = os.environ["LEX_BOT_ID"]
 LEX_BOT_ALIAS_ID = os.environ["LEX_BOT_ALIAS_ID"]
 LEX_LOCALE_ID = os.environ.get("LEX_LOCALE_ID", "en_US")
 
-ES_ENDPOINT = os.environ["ES_ENDPOINT"]          # e.g. search-photos-xxxx.us-east-1.es.amazonaws.com
+ES_ENDPOINT = os.environ["ES_ENDPOINT"]      # without https://
 ES_INDEX = os.environ.get("ES_INDEX", "photos")
-AWS_REGION = os.environ.get("AWS_REGION", "us-east-1")
+S3_BUCKET = os.environ.get("S3_BUCKET")      # optional
 
-# ========== CLIENTS ==========
-lex = boto3.client("lexv2-runtime")
+region = os.environ.get("AWS_REGION", "us-east-1")
+
+# --- Clients ---
+
+lex_client = boto3.client("lexv2-runtime")
 
 session = boto3.Session()
 credentials = session.get_credentials()
 awsauth = AWS4Auth(
     credentials.access_key,
     credentials.secret_key,
-    AWS_REGION,
-    "es",  # service name for OpenSearch/ES domain
+    region,
+    "es",
     session_token=credentials.token,
 )
 
-es = OpenSearch(
+os_client = OpenSearch(
     hosts=[{"host": ES_ENDPOINT, "port": 443}],
     http_auth=awsauth,
     use_ssl=True,
@@ -36,133 +40,205 @@ es = OpenSearch(
 )
 
 
-# ========== HELPER FUNCTIONS ==========
-
-def get_query_from_event(event):
+def get_keywords_from_lex(query: str):
     """
-    Support both:
-      { "q": "show me dog" }                        (console test)
-      { "queryStringParameters": { "q": "..." } }   (API Gateway)
+    Send the user text to Lex and pull out the 'keywords' slot.
+    Supports both single-value and multiple-value slots.
+    Returns a list of keywords (0, 1 or more).
     """
-    if "q" in event:
-        return event["q"]
+    session_id = str(uuid.uuid4())  # new session for every search
 
-    qsp = event.get("queryStringParameters") or {}
-    return qsp.get("q")
-
-
-def get_keywords_from_lex(q: str):
-    """
-    Call Amazon Lex V2 with text query q and return a list of keywords (slot values).
-    """
-    resp = lex.recognize_text(
+    resp = lex_client.recognize_text(
         botId=LEX_BOT_ID,
         botAliasId=LEX_BOT_ALIAS_ID,
         localeId=LEX_LOCALE_ID,
-        sessionId="lf2-session",
-        text=q,
+        sessionId=session_id,
+        text=query,
     )
 
-    # slots live under sessionState.intent.slots
+    # Try sessionState.intent.slots first
     slots = (
         resp.get("sessionState", {})
-            .get("intent", {})
-            .get("slots", {})
-        or {}
-    )
+        .get("intent", {})
+        .get("slots", {})
+    ) or {}
+
+    # Fallback: sometimes slots appear in interpretations[0].intent.slots
+    if not slots:
+        interpretations = resp.get("interpretations") or []
+        if interpretations:
+            slots = (
+                interpretations[0]
+                .get("intent", {})
+                .get("slots", {})
+            ) or {}
+
+    kw_slot = slots.get("keywords")
+    if not kw_slot:
+        print("No 'keywords' slot found in Lex response:", json.dumps(resp))
+        return []
 
     keywords = []
-    for slot in slots.values():
-        if slot and "value" in slot:
-            iv = slot["value"].get("interpretedValue")
-            if iv:
-                keywords.append(iv)
 
+    # --- Case 1: multi-value slot (allowMultipleValues = true) ---
+    if "values" in kw_slot:
+        for item in kw_slot.get("values") or []:
+            v = (
+                item.get("value", {})
+                .get("interpretedValue")
+            )
+            if v:
+                keywords.append(v.strip())
+
+    # --- Case 2: classic single-value slot ---
+    elif "value" in kw_slot:
+        raw = kw_slot["value"]["interpretedValue"]  # e.g. "dog and cat"
+        tmp = raw.replace(" and ", ",")
+        parts = [p.strip() for p in tmp.split(",")]
+        keywords.extend([p for p in parts if p])
+
+    # Remove duplicates / empties
+    keywords = [k for k in dict.fromkeys(keywords) if k]
+
+    print("Lex keywords slot parsed as:", keywords)
     return keywords
 
 
-def search_photos_in_es(keywords):
+def search_photos_in_opensearch(keywords):
     """
-    Search the 'photos' index in OpenSearch using the keywords from Lex.
-    Returns a list of result objects for the API response.
+    Perform a search on the OpenSearch 'photos' index using the labels field.
+
+    For multiple keywords (e.g. ["cat", "dog"]), we want OR semantics:
+    return any photo that has at least one of the labels.
     """
     if not keywords:
         return []
 
-    # require all keywords (AND). If you wanted OR, you'd use "should" instead.
-    must_clauses = []
-    for kw in keywords:
-        must_clauses.append({
-            "multi_match": {
-                "query": kw,
-                "fields": [
-                    "labels",
-                    "labels.keyword",
-                    "objects",
-                    "objects.keyword",
-                ],
-            }
-        })
+    # OR over all keywords: a photo that matches ANY of them should be returned
+    should_clauses = [{"match": {"labels": kw}} for kw in keywords]
 
     query = {
+        "size": 50,
         "query": {
             "bool": {
-                "must": must_clauses
+                "should": should_clauses,
+                "minimum_should_match": 1,
             }
         }
     }
 
-    response = es.search(index=ES_INDEX, body=query)
-    hits = response.get("hits", {}).get("hits", [])
+    print("OpenSearch query:", json.dumps(query))
 
+    resp = os_client.search(index=ES_INDEX, body=query)
+
+    hits = resp.get("hits", {}).get("hits", [])
     results = []
-    for hit in hits:
-        source = hit.get("_source", {})
 
-        # Shape this to match your assignment's API spec.
-        # This is the common schema used in the photo search lab:
-        result_item = {
-            "bucket": source.get("bucket"),
-            "objectKey": source.get("objectKey"),
-            "labels": source.get("labels", []),
-        }
-        results.append(result_item)
+    for hit in hits:
+        src = hit.get("_source", {})
+
+        # Optionally construct a URL to the S3 object
+        url = None
+        if S3_BUCKET and src.get("objectKey"):
+            # adjust if you use CloudFront or a different URL pattern
+            url = f"https://{S3_BUCKET}.s3.amazonaws.com/{src['objectKey']}"
+
+        results.append(
+            {
+                "objectKey": src.get("objectKey"),
+                "bucket": src.get("bucket"),
+                "createdTimestamp": src.get("createdTimestamp"),
+                "labels": src.get("labels", []),
+                "url": url,
+            }
+        )
 
     return results
 
 
-# ========== MAIN HANDLER ==========
-
 def lambda_handler(event, context):
-    # 1. Read query q
-    q = get_query_from_event(event)
-    print("DEBUG event:", json.dumps(event))
-    print("DEBUG raw q:", q)
+    """
+    Supports:
+      - Direct invocation: { "q": "show me dog" }
+      - API Gateway GET: event["queryStringParameters"]["q"]
+      - API Gateway POST JSON body: { "q": "show me dog" }
+    """
+    print("Incoming event:", json.dumps(event))
+
+    # 1. Extract query q
+    q = None
+
+    # a) Direct invocation or generic dict: { "q": "..." }
+    if isinstance(event, dict):
+        q = event.get("q")
+
+    # b) From queryStringParameters: ?q=...
+    if not q and isinstance(event, dict):
+        qs = event.get("queryStringParameters") or {}
+        q = qs.get("q")
+
+    # c) From JSON body: { "q": "..." }
+    if not q and isinstance(event, dict) and event.get("body"):
+        try:
+            body_json = event["body"]
+            if isinstance(body_json, str):
+                body_json = json.loads(body_json)
+            if isinstance(body_json, dict):
+                q = body_json.get("q")
+        except Exception as e:
+            print("Error parsing body JSON:", e)
+
+    print("Raw query text:", q)
 
     if not q:
+        # No query → empty results as per spec
+        body = {"query": None, "keywords": [], "results": []}
         return {
-            "statusCode": 400,
-            "headers": {"Content-Type": "application/json"},
-            "body": json.dumps({"message": "Missing query parameter 'q'"}),
+            "statusCode": 200,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*",
+            },
+            "body": json.dumps(body),
         }
 
-    # 2. Disambiguate using Lex (Part 2)
-    keywords = get_keywords_from_lex(q)
-    print("DEBUG keywords from Lex:", keywords)
+    # 2. Get keywords from Lex
+    try:
+        keywords = get_keywords_from_lex(q)
+    except Exception as e:
+        print("Error calling Lex, falling back to simple split:", e)
+        tmp = q.replace(" and ", ",")
+        keywords = [p.strip() for p in tmp.split(",") if p.strip()]
 
-    # 🔑 If Lex returns nothing, fall back to the raw query string
+    print("Final keywords used for search:", keywords)
+
+    # 3. If no keywords → empty results
     if not keywords:
-        keywords = [q]
-        print("DEBUG falling back to raw query:", keywords)
+        body = {"query": q, "keywords": [], "results": []}
+        return {
+            "statusCode": 200,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*",
+            },
+            "body": json.dumps(body),
+        }
 
-    # 3. Search ES with whatever keywords we have
-    es_results = search_photos_in_es(keywords)
-    print("DEBUG ES results:", es_results)
+    # 4. Search OpenSearch
+    results = search_photos_in_opensearch(keywords)
 
-    body = {"results": es_results}
+    # 5. Return results according to API spec
+    body = {
+        "query": q,
+        "keywords": keywords,
+        "results": results,
+    }
 
     return {
         "statusCode": 200,
-        "headers": {"Content-Type": "application/json"},
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+        },
         "body": json.dumps(body),
     }
